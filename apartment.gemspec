@@ -24,8 +24,8 @@ Gem::Specification.new do |s|
   s.add_dependency 'parallel',        '>= 0.7.1'
 
   s.add_development_dependency 'appraisal'
-  s.add_development_dependency 'rake',         '~> 0.9'
-  s.add_development_dependency 'capybara',     '~> 2.0'
+  s.add_development_dependency 'rake'
+  s.add_development_dependency 'capybara',     '~> 3.0'
   s.add_development_dependency 'pry-byebug'
 
   if defined?(JRUBY_VERSION)
