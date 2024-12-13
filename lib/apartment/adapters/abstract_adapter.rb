@@ -1,7 +1,7 @@
 module Apartment
   module Adapters
     class AbstractAdapter
-      ConnectionName = Struct.new('ConnectionName', :name, :primary_class?)
+      ConnectionName = Struct.new('ConnectionName', :name, :primary_class?, :current_preventing_writes)
       include ActiveSupport::Callbacks
       define_callbacks :create, :switch
 

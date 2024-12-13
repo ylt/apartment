@@ -21,7 +21,7 @@ module Apartment
       def simple_switch(config)
         Apartment.connection.execute("use `#{config[:database]}`")
       rescue ActiveRecord::StatementInvalid => e
-        if !e.message.match?("We could not find your database: #{config[:database]}")
+        if !["Unknown database '#{config[:database]}'", "We could not find your database: #{config[:database]}"].any? { |m| e.message.match?(m) }
           # borked connection, remove it and reconnect the connection
           connection_switch!(config, reconnect: true)
         else
