@@ -26,7 +26,7 @@ class MultithreadingTest < Apartment::Test
 
         assert_tenant_is(db)
 
-        Apartment.connection_class.clear_active_connections!
+        Apartment.connection_class.connection_handler.clear_active_connections!
       end
     end
 
