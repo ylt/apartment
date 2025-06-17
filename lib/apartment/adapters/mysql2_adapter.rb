@@ -4,29 +4,8 @@ require 'digest'
 module Apartment
   module Adapters
     class Mysql2Adapter < AbstractAdapter
-      def switch_tenant(config)
-        difference = current_difference_from(config)
-
-        if difference[:host]
-          connection_switch!(config)
-        else
-          simple_switch(config)
-        end
-      end
-
       def create_tenant!(config)
         Apartment.connection.create_database(config[:database], config)
-      end
-
-      def simple_switch(config)
-        Apartment.connection.execute("use `#{config[:database]}`")
-      rescue ActiveRecord::StatementInvalid => e
-        if !["Unknown database '#{config[:database]}'", "We could not find your database: #{config[:database]}"].any? { |m| e.message.match?(m) }
-          # borked connection, remove it and reconnect the connection
-          connection_switch!(config, reconnect: true)
-        else
-          raise_connect_error!(config[:database], e)
-        end
       end
 
       def connection_specification_name(config)

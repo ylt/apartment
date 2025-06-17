@@ -2,6 +2,9 @@ module Apartment
   module Adapters
     class AbstractAdapter
       ConnectionName = Struct.new('ConnectionName', :name, :primary_class?, :current_preventing_writes)
+
+      CONNECTION_MANAGEMENT_MUTEX = Mutex.new
+
       include ActiveSupport::Callbacks
       define_callbacks :create, :switch
 
@@ -13,34 +16,61 @@ module Apartment
         Rails.logger.warn "Unable to connect to default tenant"
       end
 
-      def reset
-        switch!(Apartment.default_tenant)
+      def switch(tenant_name)
+        switch!(tenant_name)
+        res = yield
+        pop!
+        res
       end
 
-      def switch(tenant = nil)
-        previous_tenant = @current
-        switch!(tenant)
-
-        yield
-      ensure
-        begin
-          switch!(previous_tenant)
-        rescue => e
-          Rails.logger.error "Failed to switch back to previous tenant: #{previous_tenant}"
-          Rails.logger.error e.message
-          e.backtrace.each do |bt|
-            Rails.logger.error bt
-          end
-          begin
-            reset
-          rescue => e
-            Rails.logger.error "Unable to switch back to previous tenant, or reset to default tenant: #{Apartment.default_tenant}"
-            Rails.logger.error e.message
-            e.backtrace.each do |bt|
-              Rails.logger.error bt
-            end
+      def create_pool_if_none!(config)
+        name = config[:database]
+        CONNECTION_MANAGEMENT_MUTEX.synchronize do
+          if Apartment.connection_class.connection_handler.connection_pool_list(name).none?
+            Apartment.connection_class.connection_handler.establish_connection(config, role: name)
           end
         end
+      end
+
+      def switch!(tenant_name)
+        run_callbacks :switch do
+          Thread.current[:apartment_tenant] ||= []
+          Thread.current[:apartment_tenant] << tenant_name
+
+          if tenant_name
+            connect_to(config_for(tenant_name))
+          else
+            reset
+          end
+        end
+      end
+
+      def pop!
+        Thread.current[:apartment_tenant]&.pop
+
+        tenant_name = Thread.current[:apartment_tenant]&.last
+        if tenant_name
+          connect_to(config_for(tenant_name))
+        else
+          reset
+        end
+      end
+
+      def reset
+        fiber = Thread.current[:apartment_fiber]
+        Thread.current[:apartment_fiber] = nil
+        fiber&.resume
+      end
+
+      def connect_to(config)
+        reset
+        create_pool_if_none!(config)
+
+        Thread.current[:apartment_fiber] = Fiber.new do
+          Apartment.connection_class.connected_to(role: config[:database]) do
+            Fiber.yield
+          end
+        end.tap(&:resume)
       end
 
       def create(tenant)
@@ -48,14 +78,9 @@ module Apartment
           begin
             previous_tenant = @current
             config = config_for(tenant)
-            difference = current_difference_from(config)
-
-            if difference[:host]
-              connection_switch!(config, without_keys: [:database, :schema_search_path])
-            end
 
             create_tenant!(config)
-            simple_switch(config)
+            switch!(config)
             @current = tenant
 
             import_database_schema
@@ -72,11 +97,6 @@ module Apartment
         previous_tenant = @current
 
         config = config_for(tenant)
-        difference = current_difference_from(config)
-
-        if difference[:host]
-          connection_switch!(config, without_keys: [:database])
-        end
 
         unless database_exists?(config[:database])
           raise TenantNotFound, "Error while dropping database #{config[:database]} for tenant #{tenant}"
@@ -87,26 +107,6 @@ module Apartment
         @current = tenant
       ensure
         switch!(previous_tenant) rescue reset
-      end
-
-      def switch!(tenant)
-        run_callbacks :switch do
-          unless valid_tenant?(tenant)
-            raise_connect_error!(tenant, ApartmentError.new("Invalid tenant!"))
-          end
-
-          config = config_for(tenant)
-
-          if Apartment.force_reconnect_on_switch
-            connection_switch!(config)
-          else
-            switch_tenant(config)
-          end
-
-          Apartment.connection.clear_query_cache
-
-          @current = tenant
-        end
       end
 
       def config_for(tenant)
@@ -149,30 +149,6 @@ module Apartment
       def current_difference_from(config)
         current_config = config_for(@current)
         config.select{ |k, v| current_config[k] != v }
-      end
-
-      def connection_switch!(config, without_keys: [], reconnect: false)
-        config = config.reject{ |k, _| without_keys.include?(k) }
-        owner_name = ConnectionName.new(connection_specification_name(config), false)
-
-        Apartment.connection_handler.remove_connection_pool(owner_name.name) if reconnect
-
-        unless Apartment.connection_handler.retrieve_connection_pool(owner_name.name)
-          Apartment.connection_handler.establish_connection(config, owner_name: owner_name)
-        end
-
-        begin
-          previous = Thread.current[:_apartment_connection_specification_name]
-          Thread.current[:_apartment_connection_specification_name] = owner_name.name
-
-          if (config[:database] || config[:schema_search_path]) && !reconnect
-            simple_switch(config)
-          end
-        rescue
-          Thread.current[:_apartment_connection_specification_name] = previous
-
-          raise
-        end
       end
 
       def import_database_schema
