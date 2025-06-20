@@ -65,6 +65,7 @@ module Apartment
       def connect_to(config)
         reset
         create_pool_if_none!(config)
+        @current = config[:database]
 
         Thread.current[:apartment_fiber] = Fiber.new do
           Apartment.connection_class.connected_to(role: config[:database]) do
