@@ -23,10 +23,10 @@ module Apartment
       #   res
       # end
 
-      def switch(tenant_name)
-        config = config_for(tenant_name)
+      def switch(tenant)
+        config = config_for(tenant)
         create_pool_if_none!(config)
-        @current = tenant_name
+        @current = tenant
         Apartment.connection_class.connected_to(shard: config[:database]) do
           yield
         end
@@ -44,13 +44,13 @@ module Apartment
         raise Apartment::TenantNotFound, "Error while connecting to tenant #{name}: #{exception.message}"
       end
 
-      def switch!(tenant_name)
+      def switch!(tenant)
         run_callbacks :switch do
           Thread.current[:apartment_tenant] ||= []
-          Thread.current[:apartment_tenant] << tenant_name
+          Thread.current[:apartment_tenant] << tenant
 
-          if tenant_name
-            connect_to(config_for(tenant_name))
+          if tenant
+            connect_to(config_for(tenant))
           else
             reset
           end
@@ -89,19 +89,18 @@ module Apartment
       def create(tenant)
         run_callbacks :create do
           begin
-            previous_tenant = @current
             config = config_for(tenant)
 
             create_tenant!(config)
-            switch!(config)
-            @current = tenant
+            switch(config) do
+              # we also need to switch the base as the schema isn't scoped to ApplicationRecord
+              ActiveRecord::Base.connected_to(shard: config[:database]) do
+                import_database_schema
+                seed_data if Apartment.seed_after_create
 
-            import_database_schema
-            seed_data if Apartment.seed_after_create
-
-            yield if block_given?
-          ensure
-            switch!(previous_tenant) rescue reset
+                yield if block_given?
+              end
+            end
           end
         end
       end
