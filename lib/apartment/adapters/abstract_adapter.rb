@@ -35,10 +35,13 @@ module Apartment
       def create_pool_if_none!(config)
         name = config[:database]
         CONNECTION_MANAGEMENT_MUTEX.synchronize do
-          unless (Apartment.connection_class.connection_handler.retrieve_connection(ActiveRecord::Base.name, shard: name) rescue nil)
-            Apartment.connection_class.connection_handler.establish_connection(config, shard: name)
-          end
+          conn = Apartment.connection_class.connection_handler.retrieve_connection(ActiveRecord::Base.name, shard: name) rescue nil
+          conn ||= Apartment.connection_class.connection_handler.establish_connection(config, shard: name)&.lease_connection
+
+          conn.connect! unless conn.connected?
         end
+      rescue ActiveRecord::NoDatabaseError => exception
+        raise Apartment::TenantNotFound, "Error while connecting to tenant #{name}: #{exception.message}"
       end
 
       def switch!(tenant_name)
@@ -72,8 +75,8 @@ module Apartment
       end
 
       def connect_to(config)
-        reset
         create_pool_if_none!(config)
+        reset
         @current = config[:database]
 
         Thread.current[:apartment_fiber] = Fiber.new do
