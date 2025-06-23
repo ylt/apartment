@@ -16,18 +16,27 @@ module Apartment
         Rails.logger.warn "Unable to connect to default tenant"
       end
 
+      # def switch(tenant_name)
+      #   switch!(tenant_name)
+      #   res = yield
+      #   pop!
+      #   res
+      # end
+
       def switch(tenant_name)
-        switch!(tenant_name)
-        res = yield
-        pop!
-        res
+        config = config_for(tenant_name)
+        create_pool_if_none!(config)
+        @current = tenant_name
+        Apartment.connection_class.connected_to(shard: config[:database]) do
+          yield
+        end
       end
 
       def create_pool_if_none!(config)
         name = config[:database]
         CONNECTION_MANAGEMENT_MUTEX.synchronize do
-          if Apartment.connection_class.connection_handler.connection_pool_list(name).none?
-            Apartment.connection_class.connection_handler.establish_connection(config, role: name)
+          unless (Apartment.connection_class.connection_handler.retrieve_connection(ActiveRecord::Base.name, shard: name) rescue nil)
+            Apartment.connection_class.connection_handler.establish_connection(config, shard: name)
           end
         end
       end
@@ -68,7 +77,7 @@ module Apartment
         @current = config[:database]
 
         Thread.current[:apartment_fiber] = Fiber.new do
-          Apartment.connection_class.connected_to(role: config[:database]) do
+          Apartment.connection_class.connected_to(shard: config[:database]) do
             Fiber.yield
           end
         end.tap(&:resume)
@@ -140,7 +149,7 @@ module Apartment
             if !defined?(@connection_specification_name) || @connection_specification_name.nil?
               apartment_spec_name = Thread.current[:_apartment_connection_specification_name]
               return apartment_spec_name ||
-                (self == ActiveRecord::Base ? "ActiveRecord::Base" : superclass.connection_specification_name)
+                     (self == ActiveRecord::Base ? "ActiveRecord::Base" : superclass.connection_specification_name)
             end
             @connection_specification_name
           end
