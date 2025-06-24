@@ -23,6 +23,7 @@ module Apartment
       #   res
       # end
 
+
       def switch(tenant)
         config = config_for(tenant)
         create_pool_if_none!(config)
@@ -34,20 +35,27 @@ module Apartment
 
       def create_pool_if_none!(config)
         name = config[:database]
-        CONNECTION_MANAGEMENT_MUTEX.synchronize do
-          conn = Apartment.connection_class.connection_handler.retrieve_connection(ActiveRecord::Base.name, shard: name) rescue nil
-          conn ||= Apartment.connection_class.connection_handler.establish_connection(config, shard: name)&.lease_connection
+        handler = Apartment.connection_class.connection_handler
+        spec_name = Apartment.connection_class.connection_specification_name
 
-          conn.connect! unless conn.connected?
+        CONNECTION_MANAGEMENT_MUTEX.synchronize do
+          conn = handler.retrieve_connection(spec_name, shard: name) rescue nil
+          conn ||= handler.establish_connection(config, shard: name).lease_connection
+
+          next if conn.connected? || conn.database_exists?
+
+          pool = handler.retrieve_connection_pool(spec_name, shard: name)
+          pool&.release_connection
+          handler.remove_connection_pool(spec_name, shard: name)
+
+          raise TenantNotFound, "Error while connecting to tenant #{name}"
         end
-      rescue ActiveRecord::NoDatabaseError => exception
-        raise Apartment::TenantNotFound, "Error while connecting to tenant #{name}: #{exception.message}"
       end
 
       def switch!(tenant)
         run_callbacks :switch do
           Thread.current[:apartment_tenant] ||= []
-          Thread.current[:apartment_tenant] << tenant
+          # Thread.current[:apartment_tenant] << tenant
 
           if tenant
             connect_to(config_for(tenant))
