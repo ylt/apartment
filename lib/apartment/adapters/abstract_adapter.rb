@@ -10,7 +10,11 @@ module Apartment
 
       # attr_reader :current
       def current
-        Apartment.connection_class.current_shard
+        Apartment.connection_class.connection_db_config.database || ''
+      end
+
+      def current_database
+        current
       end
 
       def initialize
@@ -18,13 +22,6 @@ module Apartment
       rescue Apartment::TenantNotFound
         Rails.logger.warn "Unable to connect to default tenant"
       end
-
-      # def switch(tenant_name)
-      #   switch!(tenant_name)
-      #   res = yield
-      #   pop!
-      #   res
-      # end
 
       def switch(tenant)
         Rails.logger.info "[Apartment] Attempting to switch to tenant: #{tenant}"
@@ -43,6 +40,19 @@ module Apartment
         Rails.logger.error "[Apartment] Failed to switch to tenant #{tenant}: #{e.message}"
         raise
       end
+
+      def switch!(tenant)
+        config = config_for(tenant)
+
+        create_pool_if_none!(config)
+
+        Apartment.connection_class.connecting_to(shard: config[:database])
+      end
+
+      def reset
+        Apartment.connection_class.connected_to_stack.pop
+      end
+
 
       def create_pool_if_none!(config)
         name = config[:database]
@@ -90,87 +100,6 @@ module Apartment
         handler.remove_connection_pool(spec_name, shard: name)
 
         Rails.logger.error "[Apartment] Cleaned up connection pool for non-existent database: #{name}"
-      end
-
-      def switch!(tenant)
-        Rails.logger.info "[Apartment] Switch! to tenant: #{tenant}"
-
-        run_callbacks :switch do
-          Thread.current[:apartment_tenant] ||= []
-          # Thread.current[:apartment_tenant] << tenant
-
-          if tenant
-            Rails.logger.debug "[Apartment] Connecting to tenant: #{tenant}"
-            connect_to(config_for(tenant))
-          else
-            Rails.logger.debug "[Apartment] Resetting to default tenant"
-            reset
-          end
-        end
-
-        Rails.logger.info "[Apartment] Switch! completed for tenant: #{tenant}"
-      rescue => e
-        Rails.logger.error "[Apartment] Switch! failed for tenant #{tenant}: #{e.message}"
-        raise
-      end
-
-      def pop!
-        current_tenant = Thread.current[:apartment_tenant]&.last
-        Rails.logger.info "[Apartment] Popping tenant stack, current: #{current_tenant}"
-
-        Thread.current[:apartment_tenant]&.pop
-
-        tenant_name = Thread.current[:apartment_tenant]&.last
-        Rails.logger.info "[Apartment] After pop, switching to: #{tenant_name || 'default'}"
-
-        if tenant_name
-          connect_to(config_for(tenant_name))
-        else
-          reset
-        end
-      rescue => e
-        Rails.logger.error "[Apartment] Pop! failed: #{e.message}"
-        raise
-      end
-
-      def reset
-        Rails.logger.debug "[Apartment] Resetting apartment context"
-
-        fiber = Thread.current[:apartment_fiber]
-        Thread.current[:apartment_fiber] = nil
-
-        if fiber
-          Rails.logger.debug "[Apartment] Resuming and cleaning up fiber"
-          fiber&.resume
-        end
-
-        Rails.logger.debug "[Apartment] Reset completed"
-      rescue => e
-        Rails.logger.error "[Apartment] Reset failed: #{e.message}"
-        Thread.current[:apartment_fiber] = nil
-      end
-
-      def connect_to(config)
-        database_name = config[:database]
-        Rails.logger.info "[Apartment] Connecting to database: #{database_name}"
-
-        create_pool_if_none!(config)
-        reset
-        @current = database_name
-
-        Rails.logger.debug "[Apartment] Creating fiber for database: #{database_name}"
-
-        Thread.current[:apartment_fiber] = Fiber.new do
-          Apartment.connection_class.connected_to(shard: database_name) do
-            Rails.logger.debug "[Apartment] Fiber established connection to: #{database_name}"
-            Fiber.yield
-          end
-        end.tap(&:resume)
-
-        Rails.logger.info "[Apartment] Successfully connected to database: #{database_name}"
-      rescue => e
-        Rails.logger.error "[Apartment] Failed to connect to database #{database_name}: #{e.message}"
-        raise
       end
 
       def create(tenant)
