@@ -8,7 +8,10 @@ module Apartment
       include ActiveSupport::Callbacks
       define_callbacks :create, :switch
 
-      attr_reader :current
+      # attr_reader :current
+      def current
+        Apartment.connection_class.current_shard
+      end
 
       def initialize
         reset
@@ -23,14 +26,22 @@ module Apartment
       #   res
       # end
 
-
       def switch(tenant)
+        Rails.logger.info "[Apartment] Attempting to switch to tenant: #{tenant}"
         config = config_for(tenant)
         create_pool_if_none!(config)
         @current = tenant
+        Rails.logger.info "[Apartment] Successfully switched to tenant: #{tenant} (database: #{config[:database]})"
+
         Apartment.connection_class.connected_to(shard: config[:database]) do
-          yield
+          Rails.logger.debug "[Apartment] Inside tenant context for: #{tenant}"
+          result = yield
+          Rails.logger.debug "[Apartment] Exiting tenant context for: #{tenant}"
+          result
         end
+      rescue => e
+        Rails.logger.error "[Apartment] Failed to switch to tenant #{tenant}: #{e.message}"
+        raise
       end
 
       def create_pool_if_none!(config)
@@ -38,60 +49,128 @@ module Apartment
         handler = Apartment.connection_class.connection_handler
         spec_name = Apartment.connection_class.connection_specification_name
 
+        Rails.logger.debug "[Apartment] Checking connection pool for database: #{name}"
+
         CONNECTION_MANAGEMENT_MUTEX.synchronize do
           conn = handler.retrieve_connection(spec_name, shard: name) rescue nil
-          conn ||= handler.establish_connection(config, shard: name).lease_connection
 
-          next if conn.connected? || conn.database_exists?
+          if conn
+            Rails.logger.debug "[Apartment] Found existing connection for database: #{name}"
+          else
+            Rails.logger.debug "[Apartment] Creating new connection for database: #{name}"
+            conn = handler.establish_connection(config, shard: name).lease_connection
+          end
 
-          pool = handler.retrieve_connection_pool(spec_name, shard: name)
-          pool&.release_connection
-          handler.remove_connection_pool(spec_name, shard: name)
+          if conn.connected? || conn.database_exists?
+            Rails.logger.debug "[Apartment] Connection verified for database: #{name}"
+            return
+          end
+
+          Rails.logger.warn "[Apartment] Database not found or connection failed for: #{name}"
+
+          cleanup(config)
+
+          raise TenantNotFound, "Error while connecting to tenant #{name}"
+        rescue ActiveRecord::NoDatabaseError
+          cleanup(config)
+
+          Rails.logger.warn "[Apartment] Database raised: #{name}"
 
           raise TenantNotFound, "Error while connecting to tenant #{name}"
         end
       end
 
+      def cleanup(config)
+        name = config[:database]
+        handler = Apartment.connection_class.connection_handler
+        spec_name = Apartment.connection_class.connection_specification_name
+
+        pool = handler.retrieve_connection_pool(spec_name, shard: name)
+        pool&.release_connection
+        handler.remove_connection_pool(spec_name, shard: name)
+
+        Rails.logger.error "[Apartment] Cleaned up connection pool for non-existent database: #{name}"
+      end
+
       def switch!(tenant)
+        Rails.logger.info "[Apartment] Switch! to tenant: #{tenant}"
+
         run_callbacks :switch do
           Thread.current[:apartment_tenant] ||= []
           # Thread.current[:apartment_tenant] << tenant
 
           if tenant
+            Rails.logger.debug "[Apartment] Connecting to tenant: #{tenant}"
             connect_to(config_for(tenant))
           else
+            Rails.logger.debug "[Apartment] Resetting to default tenant"
             reset
           end
         end
+
+        Rails.logger.info "[Apartment] Switch! completed for tenant: #{tenant}"
+      rescue => e
+        Rails.logger.error "[Apartment] Switch! failed for tenant #{tenant}: #{e.message}"
+        raise
       end
 
       def pop!
+        current_tenant = Thread.current[:apartment_tenant]&.last
+        Rails.logger.info "[Apartment] Popping tenant stack, current: #{current_tenant}"
+
         Thread.current[:apartment_tenant]&.pop
 
         tenant_name = Thread.current[:apartment_tenant]&.last
+        Rails.logger.info "[Apartment] After pop, switching to: #{tenant_name || 'default'}"
+
         if tenant_name
           connect_to(config_for(tenant_name))
         else
           reset
         end
+      rescue => e
+        Rails.logger.error "[Apartment] Pop! failed: #{e.message}"
+        raise
       end
 
       def reset
+        Rails.logger.debug "[Apartment] Resetting apartment context"
+
         fiber = Thread.current[:apartment_fiber]
         Thread.current[:apartment_fiber] = nil
-        fiber&.resume
+
+        if fiber
+          Rails.logger.debug "[Apartment] Resuming and cleaning up fiber"
+          fiber&.resume
+        end
+
+        Rails.logger.debug "[Apartment] Reset completed"
+      rescue => e
+        Rails.logger.error "[Apartment] Reset failed: #{e.message}"
+        Thread.current[:apartment_fiber] = nil
       end
 
       def connect_to(config)
+        database_name = config[:database]
+        Rails.logger.info "[Apartment] Connecting to database: #{database_name}"
+
         create_pool_if_none!(config)
         reset
-        @current = config[:database]
+        @current = database_name
+
+        Rails.logger.debug "[Apartment] Creating fiber for database: #{database_name}"
 
         Thread.current[:apartment_fiber] = Fiber.new do
-          Apartment.connection_class.connected_to(shard: config[:database]) do
+          Apartment.connection_class.connected_to(shard: database_name) do
+            Rails.logger.debug "[Apartment] Fiber established connection to: #{database_name}"
             Fiber.yield
           end
         end.tap(&:resume)
+
+        Rails.logger.info "[Apartment] Successfully connected to database: #{database_name}"
+      rescue => e
+        Rails.logger.error "[Apartment] Failed to connect to database #{database_name}: #{e.message}"
+        raise
       end
 
       def create(tenant)
