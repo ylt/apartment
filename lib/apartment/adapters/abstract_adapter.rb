@@ -30,6 +30,8 @@ module Apartment
         @current = tenant
         Rails.logger.info "[Apartment] Successfully switched to tenant: #{tenant} (database: #{config[:database]})"
 
+        stack = Apartment.connection_class.connected_to_stack.dup
+
         Apartment.connection_class.connected_to(shard: config[:database]) do
           Rails.logger.debug "[Apartment] Inside tenant context for: #{tenant}"
           result = yield
@@ -39,6 +41,10 @@ module Apartment
       rescue => e
         Rails.logger.error "[Apartment] Failed to switch to tenant #{tenant}: #{e.message}"
         raise
+      ensure
+        if stack
+          Apartment.connection_class.connected_to_stack.replace(stack)
+        end
       end
 
       def switch!(tenant)
@@ -50,7 +56,7 @@ module Apartment
       end
 
       def reset
-        Apartment.connection_class.connected_to_stack.pop
+        Apartment.connection_class.connected_to_stack.clear
       end
 
 
