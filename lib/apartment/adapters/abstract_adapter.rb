@@ -10,11 +10,7 @@ module Apartment
 
       # attr_reader :current
       def current
-        Apartment.connection_class.connection_db_config.database || ''
-      end
-
-      def current_database
-        current
+        Apartment.connection_class.connection_db_config.database
       end
 
       def initialize
@@ -26,6 +22,9 @@ module Apartment
       def switch(tenant)
         Rails.logger.info "[Apartment] Attempting to switch to tenant: #{tenant}"
         config = config_for(tenant)
+
+        return yield if config[:database] == current
+
         create_pool_if_none!(config)
         @current = tenant
         Rails.logger.info "[Apartment] Successfully switched to tenant: #{tenant} (database: #{config[:database]})"
@@ -74,7 +73,13 @@ module Apartment
             Rails.logger.debug "[Apartment] Found existing connection for database: #{name}"
           else
             Rails.logger.debug "[Apartment] Creating new connection for database: #{name}"
-            conn = handler.establish_connection(config, shard: name).lease_connection
+            conn = handler.establish_connection(config, shard: name).yield_self do |conn|
+              if conn.respond_to?(:lease_connection) # Rails 7.2+
+                conn.lease_connection
+              elsif !conn.respond_to?(:database_exists?)
+                conn.connection
+              end
+            end
           end
 
           if conn.connected? || conn.database_exists?
