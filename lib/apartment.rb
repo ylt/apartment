@@ -10,7 +10,7 @@ module Apartment
 
     ACCESSOR_METHODS = [
       :use_sql, :seed_after_create, :tenant_decorator,
-      :force_reconnect_on_switch, :pool_per_config
+      :force_reconnect_on_switch, :pool_per_config, :enable_cross_tenant_transactions
     ]
     WRITER_METHODS   = [
       :tenant_names, :database_schema_file, :excluded_models,
@@ -65,6 +65,14 @@ module Apartment
 
     def parallel_migration_threads
       @parallel_migration_threads || 0
+    end
+
+    # Whether or not to enable cross-tenant transactions
+    # defaults to false for backward compatibility
+    def enable_cross_tenant_transactions
+      return @enable_cross_tenant_transactions if defined?(@enable_cross_tenant_transactions)
+
+      @enable_cross_tenant_transactions = false
     end
 
     def persistent_schemas

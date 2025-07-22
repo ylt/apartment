@@ -1,3 +1,5 @@
+require_relative '../transaction'
+
 module Apartment
   module Adapters
     class AbstractAdapter
@@ -14,9 +16,70 @@ module Apartment
       end
 
       def initialize
+        @transaction_stack = [] if Apartment.enable_cross_tenant_transactions
         reset
       rescue Apartment::TenantNotFound
         Rails.logger.warn "Unable to connect to default tenant"
+      end
+
+      def transaction(&block)
+        return yield unless Apartment.enable_cross_tenant_transactions
+        
+        begin_transaction
+        begin
+          yield
+          commit_transaction
+        rescue Exception => e
+          rollback_transaction
+          raise e
+        end
+      end
+      
+      def begin_transaction(options = {})
+        return unless Apartment.enable_cross_tenant_transactions
+        
+        # Create a new transaction and push it onto the stack
+        transaction = Apartment::Transaction.new
+        @transaction_stack.push(transaction)
+        
+        # Always add the current connection immediately
+        connection = Apartment.connection_class.connection
+        transaction.add_connection(connection)
+        
+        Rails.logger.info "[Apartment] Transaction started (depth: #{@transaction_stack.size})"
+        transaction
+      end
+      
+      def commit_transaction
+        return unless Apartment.enable_cross_tenant_transactions
+        
+        transaction = @transaction_stack.pop
+        raise "No transaction to commit" unless transaction
+        
+        transaction.commit
+        Rails.logger.info "[Apartment] Transaction committed (remaining depth: #{@transaction_stack.size})"
+      end
+      
+      def rollback_transaction
+        return unless Apartment.enable_cross_tenant_transactions
+        
+        transaction = @transaction_stack.pop
+        raise "No transaction to rollback" unless transaction
+        
+        transaction.rollback
+        Rails.logger.info "[Apartment] Transaction rolled back (remaining depth: #{@transaction_stack.size})"
+      end
+      
+      def current_transaction
+        return nil unless Apartment.enable_cross_tenant_transactions
+        @transaction_stack&.last
+      end
+
+      public
+
+      def in_transaction?
+        return false unless Apartment.enable_cross_tenant_transactions
+        current_transaction && !current_transaction.completed?
       end
 
       def switch(tenant)
@@ -25,16 +88,31 @@ module Apartment
 
         return yield if config[:database] == current
 
-        create_pool_if_none!(config)
+        target = { shard: config[:database] }
+
+        if config[:database] == Rails.application.config.database_configuration[Rails.env]['primary']['database']
+          target = { shard: :default }
+        else
+          create_pool_if_none!(config)
+        end
+
         @current = tenant
         Rails.logger.info "[Apartment] Successfully switched to tenant: #{tenant} (database: #{config[:database]})"
 
         stack = Apartment.connection_class.connected_to_stack.dup
 
-        Apartment.connection_class.connected_to(shard: config[:database]) do
-          Rails.logger.debug "[Apartment] Inside tenant context for: #{tenant}"
+        Apartment.connection_class.connected_to(**target) do
+          Rails.logger.debug{ "[Apartment] Inside tenant context for: #{tenant}" }
+
+          # If we're inside a transaction, add this connection to the current transaction
+          if Apartment.enable_cross_tenant_transactions && in_transaction?
+            connection = Apartment.connection_class.connection
+            current_transaction.add_connection(connection)
+            Rails.logger.debug{ "[Apartment] Added connection for #{config[:database]} to current transaction" }
+          end
+
           result = yield
-          Rails.logger.debug "[Apartment] Exiting tenant context for: #{tenant}"
+          Rails.logger.debug{ "[Apartment] Exiting tenant context for: #{tenant}" }
           result
         end
       rescue => e
@@ -58,32 +136,25 @@ module Apartment
         Apartment.connection_class.connected_to_stack.clear
       end
 
-
       def create_pool_if_none!(config)
         name = config[:database]
         handler = Apartment.connection_class.connection_handler
         spec_name = Apartment.connection_class.connection_specification_name
 
-        Rails.logger.debug "[Apartment] Checking connection pool for database: #{name}"
+        Rails.logger.debug{ "[Apartment] Checking connection pool for database: #{name}" }
 
         CONNECTION_MANAGEMENT_MUTEX.synchronize do
           conn = handler.retrieve_connection(spec_name, shard: name) rescue nil
 
           if conn
-            Rails.logger.debug "[Apartment] Found existing connection for database: #{name}"
+            Rails.logger.debug{ "[Apartment] Found existing connection for database: #{name}" }
           else
-            Rails.logger.debug "[Apartment] Creating new connection for database: #{name}"
-            conn = handler.establish_connection(config, shard: name).yield_self do |conn|
-              if conn.respond_to?(:lease_connection) # Rails 7.2+
-                conn.lease_connection
-              elsif !conn.respond_to?(:database_exists?)
-                conn.connection
-              end
-            end
+            Rails.logger.debug{ "[Apartment] Creating new connection for database: #{name}" }
+            conn = handler.establish_connection(config, shard: name)&.lease_connection
           end
 
           if conn.connected? || conn.database_exists?
-            Rails.logger.debug "[Apartment] Connection verified for database: #{name}"
+            Rails.logger.debug{ "[Apartment] Connection verified for database: #{name}" }
             return
           end
 
@@ -115,18 +186,16 @@ module Apartment
 
       def create(tenant)
         run_callbacks :create do
-          begin
-            config = config_for(tenant)
+          config = config_for(tenant)
 
-            create_tenant!(config)
-            switch(config) do
-              # we also need to switch the base as the schema isn't scoped to ApplicationRecord
-              ActiveRecord::Base.connected_to(shard: config[:database]) do
-                import_database_schema
-                seed_data if Apartment.seed_after_create
+          create_tenant!(config)
+          switch(config) do
+            # we also need to switch the base as the schema isn't scoped to ApplicationRecord
+            ActiveRecord::Base.connected_to(shard: config[:database]) do
+              import_database_schema
+              seed_data if Apartment.seed_after_create
 
-                yield if block_given?
-              end
+              yield if block_given?
             end
           end
         end
@@ -178,9 +247,73 @@ module Apartment
             if !defined?(@connection_specification_name) || @connection_specification_name.nil?
               apartment_spec_name = Thread.current[:_apartment_connection_specification_name]
               return apartment_spec_name ||
-                     (self == ActiveRecord::Base ? "ActiveRecord::Base" : superclass.connection_specification_name)
+                  (self == ActiveRecord::Base ? "ActiveRecord::Base" : superclass.connection_specification_name)
             end
             @connection_specification_name
+          end
+        end
+        
+        # Monkeypatch transaction methods on Apartment.connection_class to use Apartment's transaction management
+        # Only apply this monkeypatch if cross-tenant transactions are enabled
+        if Apartment.enable_cross_tenant_transactions
+          Apartment.connection_class.class_eval do
+            class << self
+              alias_method :original_transaction, :transaction unless method_defined?(:original_transaction)
+              
+              def transaction(options = {}, &block)
+                adapter = Apartment::Tenant.adapter
+                if adapter && adapter.respond_to?(:transaction)
+                  adapter.transaction(&block)
+                else
+                  original_transaction(options, &block)
+                end
+              end
+              
+              def begin_transaction(options = {})
+                adapter = Apartment::Tenant.adapter
+                if adapter && adapter.respond_to?(:begin_transaction)
+                  adapter.begin_transaction(options)
+                else
+                  connection.begin_transaction(options)
+                end
+              end
+              
+              def commit_transaction
+                adapter = Apartment::Tenant.adapter
+                if adapter && adapter.respond_to?(:commit_transaction)
+                  adapter.commit_transaction
+                else
+                  connection.commit_db_transaction
+                end
+              end
+              
+              def rollback_transaction
+                adapter = Apartment::Tenant.adapter
+                if adapter && adapter.respond_to?(:rollback_transaction)
+                  adapter.rollback_transaction
+                else
+                  connection.rollback_db_transaction
+                end
+              end
+              
+              def in_transaction?
+                adapter = Apartment::Tenant.adapter
+                if adapter && adapter.respond_to?(:in_transaction?)
+                  adapter.in_transaction?
+                else
+                  connection.transaction_open?
+                end
+              end
+              
+              def current_transaction
+                adapter = Apartment::Tenant.adapter
+                if adapter && adapter.respond_to?(:current_transaction)
+                  adapter.current_transaction
+                else
+                  connection.current_transaction
+                end
+              end
+            end
           end
         end
       end
